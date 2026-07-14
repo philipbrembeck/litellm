@@ -377,3 +377,70 @@ async def test_token_gates_on_live_user_revalidation(failure, expected_status, e
     )
     assert response.status_code == expected_status
     assert json.loads(response.body)["error"] == expected_error
+
+
+@pytest.mark.asyncio
+async def test_flow_minted_session_token_is_admissible_at_the_aggregate_edge():
+    """Capstone: a session token minted by THIS flow's token endpoint is admitted by the
+    aggregate /mcp admission arm as the signed-in user. Chains the producer (aggregate_token)
+    into the consumer (process_mcp_request) with one shared master key, so the two sides
+    cannot drift on key derivation, prefix, issuer, or claim shape."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    from litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp import MCPRequestHandler
+
+    client_id = (await _register([REDIRECT_URI]))["client_id"]
+    authorize_response = _authorize(client_id, session_user_id="capstone-user")
+    handle, cookies = _flow_cookie_from(authorize_response)
+    completed = complete_connect_flow(
+        request=_request("/authorize/complete", cookies=cookies, method="POST"),
+        flow_handle=handle,
+        session_user_id="capstone-user",
+    )
+    code = parse_qs(urlparse(completed.headers["location"]).query)["code"][0]
+
+    token_response = await aggregate_token(
+        request=_request("/token", method="POST"),
+        grant_type="authorization_code",
+        code=code,
+        redirect_uri=REDIRECT_URI,
+        client_id=client_id,
+        code_verifier=CODE_VERIFIER,
+        refresh_token=None,
+        master_key=MASTER_KEY,
+        reload_user=_reload_user_active,
+        cache=DualCache(),
+    )
+    access_token = json.loads(token_response.body)["access_token"]
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"host", b"testserver"), (b"authorization", f"Bearer {access_token}".encode())],
+    }
+    reloaded_user = MagicMock(
+        user_id="capstone-user",
+        metadata={"scim_active": True},
+        user_role=None,
+        object_permission=None,
+        object_permission_id=None,
+    )
+    with (
+        patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.is_mcp_gateway_dcr_enabled",
+            return_value=True,
+        ),
+        patch("litellm.proxy.proxy_server.master_key", MASTER_KEY),
+        patch("litellm.proxy.auth.auth_checks.get_user_object", AsyncMock(return_value=reloaded_user)),
+        patch("litellm.proxy.proxy_server.prisma_client", MagicMock()),
+        patch("litellm.proxy.proxy_server.user_api_key_cache", MagicMock()),
+        patch(
+            "litellm.proxy._experimental.mcp_server.auth.user_api_key_auth_mcp.user_api_key_auth",
+            new_callable=AsyncMock,
+        ) as raw_key_pipeline,
+    ):
+        auth_result, *_rest = await MCPRequestHandler.process_mcp_request(scope)
+
+    assert auth_result.user_id == "capstone-user"
+    raw_key_pipeline.assert_not_called()
