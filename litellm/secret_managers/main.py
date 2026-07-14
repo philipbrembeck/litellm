@@ -203,6 +203,38 @@ def get_secret(
             if env_secret is None:
                 raise ValueError("CIRCLE_OIDC_TOKEN_V2 not found in environment")
             return env_secret
+        elif oidc_provider == "aws":
+            oidc_token = oidc_cache.get_cache(key=secret_name)
+            if oidc_token is not None:
+                return oidc_token
+
+            import boto3
+
+            region = os.getenv("AWS_REGION_NAME") or os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION")
+            if region is None:
+                raise ValueError("AWS region not found. Set AWS_REGION_NAME, AWS_REGION, or AWS_DEFAULT_REGION")
+
+            sts_client = boto3.client(
+                "sts",
+                region_name=region,
+                # GetWebIdentityToken is not served by the STS global endpoint.
+                endpoint_url=f"https://sts.{region}.amazonaws.com",
+            )
+            resp = sts_client.get_web_identity_token(
+                Audience=[oidc_aud],
+                DurationSeconds=3600,
+                # RS256, not ES384: AWS recommends ES384, but Entra ID
+                # federated credentials require RS256.
+                SigningAlgorithm="RS256",
+            )
+            # AWS docs name this field IdentityToken; the SDK returns WebIdentityToken.
+            oidc_token = resp.get("WebIdentityToken") or resp.get("IdentityToken")
+            if not isinstance(oidc_token, str):
+                raise ValueError(
+                    "AWS STS GetWebIdentityToken returned no token. Check the IAM role has sts:GetWebIdentityToken."
+                )
+            oidc_cache.set_cache(key=secret_name, value=oidc_token, ttl=3300)
+            return oidc_token
         elif oidc_provider == "github":
             # https://docs.github.com/en/actions/deployment/security-hardening-your-deployments/configuring-openid-connect-in-cloud-providers#using-custom-actions
             actions_id_token_request_url = os.getenv("ACTIONS_ID_TOKEN_REQUEST_URL")

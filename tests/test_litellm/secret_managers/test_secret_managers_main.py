@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 from unittest.mock import Mock, patch
 
 import pytest
@@ -163,6 +164,68 @@ def test_oidc_github_missing_env():
         match="ACTIONS_ID_TOKEN_REQUEST_URL or ACTIONS_ID_TOKEN_REQUEST_TOKEN not found in environment",
     ):
         get_secret(secret_name)
+
+
+def test_oidc_aws_success_parses_audience(monkeypatch):
+    monkeypatch.setenv("AWS_REGION_NAME", "us-east-1")
+    secret_name = "oidc/aws/api://AzureADTokenExchange"
+    mock_sts = Mock()
+    mock_sts.get_web_identity_token.return_value = {"WebIdentityToken": "aws_token"}
+    mock_boto3 = Mock()
+    mock_boto3.client.return_value = mock_sts
+    mock_oidc_cache = Mock()
+    mock_oidc_cache.get_cache.return_value = None
+
+    with patch.dict(sys.modules, {"boto3": mock_boto3}):
+        with patch("litellm.secret_managers.main.oidc_cache", mock_oidc_cache):
+            result = get_secret(secret_name)
+
+    assert result == "aws_token"
+    mock_boto3.client.assert_called_once_with(
+        "sts",
+        region_name="us-east-1",
+        endpoint_url="https://sts.us-east-1.amazonaws.com",
+    )
+    mock_sts.get_web_identity_token.assert_called_once_with(
+        Audience=["api://AzureADTokenExchange"],
+        DurationSeconds=3600,
+        SigningAlgorithm="RS256",
+    )
+    mock_oidc_cache.set_cache.assert_called_once_with(
+        key=secret_name, value="aws_token", ttl=3300
+    )
+
+
+def test_oidc_aws_cached(monkeypatch):
+    monkeypatch.setenv("AWS_REGION_NAME", "us-east-1")
+    secret_name = "oidc/aws/api://AzureADTokenExchange"
+    mock_boto3 = Mock()
+    mock_oidc_cache = Mock()
+    mock_oidc_cache.get_cache.return_value = "cached_aws_token"
+
+    with patch.dict(sys.modules, {"boto3": mock_boto3}):
+        with patch("litellm.secret_managers.main.oidc_cache", mock_oidc_cache):
+            result = get_secret(secret_name)
+
+    assert result == "cached_aws_token"
+    mock_boto3.client.assert_not_called()
+
+
+def test_oidc_aws_missing_region(monkeypatch):
+    monkeypatch.delenv("AWS_REGION_NAME", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+    secret_name = "oidc/aws/api://AzureADTokenExchange"
+    mock_boto3 = Mock()
+    mock_oidc_cache = Mock()
+    mock_oidc_cache.get_cache.return_value = None
+
+    with patch.dict(sys.modules, {"boto3": mock_boto3}):
+        with patch("litellm.secret_managers.main.oidc_cache", mock_oidc_cache):
+            with pytest.raises(ValueError, match="AWS region not found"):
+                get_secret(secret_name)
+
+    mock_boto3.client.assert_not_called()
 
 
 def test_oidc_azure_file_success(mock_env, tmp_path):
